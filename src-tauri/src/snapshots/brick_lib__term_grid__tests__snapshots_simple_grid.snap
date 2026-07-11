@@ -1,0 +1,29 @@
+---
+source: src-tauri/src/term_grid.rs
+assertion_line: 95
+expression: grid.diff()
+---
+- row: 0
+  col: 0
+  ch: h
+  fg: ~
+  bg: ~
+  flags: []
+- row: 0
+  col: 1
+  ch: i
+  fg: ~
+  bg: ~
+  flags: []
+- row: 1
+  col: 0
+  ch: o
+  fg: ~
+  bg: ~
+  flags: []
+- row: 1
+  col: 1
+  ch: k
+  fg: ~
+  bg: ~
+  flags: []

@@ -1,0 +1,34 @@
+# Brick QA Checklist
+
+- [ ] `xcode-select -p` exits 0.
+- [ ] `cargo tauri dev` opens a macOS window titled `Brick`.
+- [ ] zsh starts in the terminal pane and accepts typed commands.
+- [ ] Raw PTY output appears in the terminal pane.
+- [ ] Nonexistent shell spawn returns an error instead of panicking.
+- [ ] SQLite database is created at `~/Library/Application Support/dev.brick.app/brick.db`.
+- [ ] Migrations create `blocks`, `panes`, `command_frequency`, `llm_backends`, `agent_sessions`, and `settings`.
+- [ ] zsh hook writes command blocks to SQLite.
+- [ ] Repeated commands increment `command_frequency.run_count`.
+- [ ] Block list remains smooth with 10,000 blocks.
+- [ ] Long output collapses after 50 lines.
+- [ ] Prompt info truncates deep paths.
+- [ ] `.nvmrc` produces a Node version badge.
+- [ ] Dirty git repo shows a dirty indicator.
+- [ ] Fuzzy suggestion for `git s` ranks `git status` first.
+- [ ] Tab accepts ghost-text suggestion.
+- [ ] Normal workspace badge is visible by default.
+- [ ] Agentic workspace badge toggles independently per pane.
+- [ ] Normal mode prevents agent calls in Rust core.
+- [ ] Secret redaction removes AWS keys, GitHub tokens, env secrets, and PEM keys.
+- [ ] High-entropy tokens are flagged before prompt assembly.
+- [ ] `git push` is Confirm tier.
+- [ ] `npm install` is Confirm tier.
+- [ ] `rm -rf /` is Blocked tier and has no approve path.
+- [ ] `ls`, `cat`, `git status`, and `git diff` are Safe tier.
+- [ ] `cargo test --workspace` passes.
+- [ ] `cargo clippy --workspace -- -D warnings` passes.
+- [ ] `cargo fmt --check` passes.
+- [ ] `yarn test` passes.
+- [ ] `yarn build` passes.
+- [ ] `yarn run check` reports zero warnings.
+- [ ] `cargo tauri build` produces a `.app` bundle on macOS.
