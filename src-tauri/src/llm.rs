@@ -9,7 +9,9 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum BackendKind {
+    #[serde(rename = "openai")]
     OpenAiCompatible,
     Bedrock,
 }

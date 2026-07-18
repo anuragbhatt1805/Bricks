@@ -144,6 +144,23 @@ async fn list_backends(
 }
 
 #[tauri::command]
+async fn save_backend(
+    state: State<'_, Arc<RwLock<Option<AppState>>>>,
+    config: database::LlmBackendConfig,
+) -> Result<(), String> {
+    let state = state.read().await;
+    let state = state.as_ref().ok_or("app state not ready")?;
+
+    // Save to database
+    state.db.insert_backend(config).await.map_err(|e| e.to_string())?;
+
+    // Reload registry immediately
+    let new_registry = llm::BackendRegistry::load(&state.db).await.map_err(|e| e.to_string())?;
+    *state.backend_registry.write().await = new_registry;
+    Ok(())
+}
+
+#[tauri::command]
 async fn redact_text(input: String) -> redact::RedactResult {
     redact::redact(&input)
 }
@@ -197,6 +214,7 @@ pub fn run() {
             set_setting,
             redact_text,
             list_backends,
+            save_backend,
             llm::test_backend_connection,
             agent::agent_run_turn,
             agent::agent_approve_command,

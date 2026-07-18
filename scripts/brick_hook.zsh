@@ -5,7 +5,7 @@ typeset -g BRICK_LAST_CWD=""
 
 function brick_preexec() {
   BRICK_LAST_COMMAND="$1"
-  BRICK_LAST_STARTED_AT=$(date +%s%3N)
+  BRICK_LAST_STARTED_AT=$(( $(date +%s) * 1000 ))
   BRICK_LAST_CWD="$PWD"
 }
 
@@ -15,7 +15,7 @@ function brick_precmd() {
     return
   fi
 
-  local now=$(date +%s%3N)
+  local now=$(( $(date +%s) * 1000 ))
   local duration=$((now - BRICK_LAST_STARTED_AT))
   local branch dirty
   branch=$(git -C "$BRICK_LAST_CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)

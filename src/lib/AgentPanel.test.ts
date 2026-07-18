@@ -32,18 +32,18 @@ describe("AgentPanel", () => {
   });
 
   it("renders when visible", async () => {
-    const { getByText } = render(AgentPanel, { visible: true, paneId: "pane_123" });
-    expect(getByText("Agent")).toBeTruthy();
-    expect(getByText("Agentic mode is ready. Ask anything about your repository.")).toBeTruthy();
+    const { getByText } = render(AgentPanel, { visible: true, mode: "agentic", paneId: "pane_123" });
+    expect(getByText("Agent Panel")).toBeTruthy();
+    expect(getByText(/Brick agent is ready/)).toBeTruthy();
   });
 
   it("does not render when invisible", () => {
-    const { queryByText } = render(AgentPanel, { visible: false, paneId: "pane_123" });
-    expect(queryByText("Agent")).toBeNull();
+    const { queryByText } = render(AgentPanel, { visible: false, mode: "agentic", paneId: "pane_123" });
+    expect(queryByText("Agent Panel")).toBeNull();
   });
 
   it("handles input and textarea keydown Enter to send", async () => {
-    const { getByPlaceholderText } = render(AgentPanel, { visible: true, paneId: "pane_123" });
+    const { getByPlaceholderText } = render(AgentPanel, { visible: true, mode: "agentic", paneId: "pane_123" });
     const textarea = getByPlaceholderText("Ask Brick...") as HTMLTextAreaElement;
     
     await fireEvent.input(textarea, { target: { value: "hello agent" } });

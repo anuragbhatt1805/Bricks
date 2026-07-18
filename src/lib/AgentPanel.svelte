@@ -5,7 +5,9 @@
   import { listen } from "@tauri-apps/api/event";
 
   export let visible = false;
+  export let mode: "normal" | "agentic" = "normal";
   export let paneId = "";
+  export let onEnableAgentic: () => void = () => {};
 
   let width = 360;
   let message = "";
@@ -80,10 +82,10 @@
       width = newWidth;
     }
 
-    async function onMouseUp() {
+    function onMouseUp() {
+      invoke("set_setting", { key: "agent.panel_width", value: width.toString() });
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
-      await invoke("set_setting", { key: "agent.panel_width", value: width.toString() });
     }
 
     window.addEventListener("mousemove", onMouseMove);
@@ -91,77 +93,72 @@
   }
 
   async function send() {
-    if (!message.trim() || isStreaming || !paneId) return;
-    let userMsg = message;
+    if (!message.trim() || isStreaming) return;
+    let text = message;
     message = "";
-
-    transcript = [...transcript, { type: "user", text: userMsg }];
+    transcript = [...transcript, { type: "user", text }];
     isStreaming = true;
 
-    // Add empty assistant turn
-    transcript = [...transcript, { type: "assistant", text: "", done: false }];
-
     try {
-      await invoke("agent_run_turn", { paneId, userMessage: userMsg });
-    } catch (e) {
-      console.error(e);
-      let lastIdx = transcript.length - 1;
-      if (lastIdx >= 0) {
-        transcript[lastIdx].text = `Error running turn: ${e}`;
-        transcript[lastIdx].done = true;
-      }
+      await invoke("agent_run_turn", {
+        paneId,
+        userMessage: text,
+      });
+    } catch (e: any) {
+      transcript = [...transcript, {
+        type: "assistant",
+        text: `Error running turn: ${e.toString()}`,
+      }];
       isStreaming = false;
     }
   }
 
   async function cancel() {
-    if (!paneId) return;
-    await invoke("cancel_agent_turn", { paneId });
-    isStreaming = false;
+    try {
+      await invoke("cancel_agent_turn", { paneId });
+    } catch (e) {
+      console.error(e);
+    }
   }
 
-  async function approve(index: number, cmd: string) {
-    if (!paneId) return;
-    await invoke("agent_approve_command", { paneId, editedCommand: null });
-    // convert proposal to assistant narrative
-    transcript[index].type = "assistant";
-    transcript[index].text = `Executing: ${cmd}`;
+  async function approve(idx: number, command: string) {
+    transcript[idx].done = true;
     transcript = [...transcript];
-    isStreaming = true;
+    try {
+      await invoke("agent_approve_command", { paneId, command });
+    } catch (e) {
+      console.error(e);
+    }
   }
 
-  function startEdit(index: number, cmd: string) {
-    editingIndex = index;
-    editedCommand = cmd;
+  function startEdit(idx: number, command: string) {
+    editingIndex = idx;
+    editedCommand = command;
   }
 
-  async function saveEdit(index: number) {
-    if (!paneId) return;
-    transcript[index].command = editedCommand;
+  async function saveEdit(idx: number) {
+    let cmd = editedCommand;
     editingIndex = -1;
-    await invoke("agent_approve_command", { paneId, editedCommand });
-    transcript[index].type = "assistant";
-    transcript[index].text = `Executing: ${editedCommand}`;
-    transcript = [...transcript];
-    isStreaming = true;
+    transcript[idx].command = cmd;
+    approve(idx, cmd);
   }
 
-  async function reject(index: number) {
-    if (!paneId) return;
-    await invoke("agent_reject_command", { paneId });
-    transcript.splice(index, 1);
+  async function reject(idx: number) {
+    transcript[idx].done = true;
     transcript = [...transcript];
-    isStreaming = false;
+    try {
+      await invoke("agent_reject_command", { paneId });
+    } catch (e) {
+      console.error(e);
+    }
   }
-
-  let unlistens: (() => void)[] = [];
 
   onMount(() => {
     let unmounted = false;
+    let unlistens: (() => void)[] = [];
 
     async function init() {
       await loadWidth();
-      if (unmounted) return;
       await loadBackends();
       if (unmounted) return;
 
@@ -169,24 +166,35 @@
         let payload = event.payload;
         if (payload.pane_id !== paneId) return;
 
+        isStreaming = true;
         let lastIdx = transcript.length - 1;
-        if (lastIdx >= 0 && transcript[lastIdx].type === "assistant") {
-          transcript[lastIdx].text += payload.delta;
-          transcript[lastIdx].contextTrimmed = payload.context_trimmed;
-          if (payload.done) {
-            transcript[lastIdx].done = true;
-          }
+        if (lastIdx >= 0 && transcript[lastIdx].type === "assistant" && !transcript[lastIdx].done) {
+          transcript[lastIdx].text += payload.chunk;
           transcript = [...transcript];
+        } else {
+          transcript = [...transcript, {
+            type: "assistant",
+            text: payload.chunk,
+            done: false,
+          }];
         }
       });
 
       let u2 = await listen<any>("agent_proposed_command", (event) => {
         let payload = event.payload;
         if (payload.pane_id !== paneId) return;
+
+        // Finish any ongoing streaming assistant box
+        let lastIdx = transcript.length - 1;
+        if (lastIdx >= 0 && transcript[lastIdx].type === "assistant") {
+          transcript[lastIdx].done = true;
+        }
+
         transcript = [...transcript, {
           type: "proposal",
           command: payload.command,
-          riskTier: payload.risk_tier,
+          riskTier: payload.risk,
+          done: false,
         }];
         isStreaming = false;
       });
@@ -194,6 +202,12 @@
       let u3 = await listen<any>("agent_blocked_command", (event) => {
         let payload = event.payload;
         if (payload.pane_id !== paneId) return;
+
+        let lastIdx = transcript.length - 1;
+        if (lastIdx >= 0 && transcript[lastIdx].type === "assistant") {
+          transcript[lastIdx].done = true;
+        }
+
         transcript = [...transcript, {
           type: "blocked",
           command: payload.command,
@@ -232,92 +246,154 @@
 </script>
 
 {#if visible}
-  <aside class="agent" style={`width:${width}px; position: relative;`}>
-    <!-- Drag Handle -->
-    <div class="resize-handle" on:mousedown={startResize}></div>
+  {#if mode === "agentic"}
+    <aside class="agent" style={`width:${width}px; position: relative;`}>
+      <!-- Drag Handle -->
+      <div class="resize-handle" on:mousedown={startResize}></div>
 
-    <header>
-      <strong>Agent</strong>
-      <select bind:value={activeBackendId} on:change={handleBackendChange} class="backend-select">
-        {#each backends as b}
-          <option value={b.id}>{b.name} ({b.is_local ? "local" : "remote"})</option>
-        {/each}
-      </select>
-    </header>
+      <header>
+        <strong>Agent Panel</strong>
+        <select bind:value={activeBackendId} on:change={handleBackendChange} class="backend-select">
+          {#each backends as b}
+            <option value={b.id}>{b.name} ({b.is_local ? "local" : "remote"})</option>
+          {/each}
+        </select>
+      </header>
 
-    <section class="transcript">
-      <div class="assistant">Agentic mode is ready. Ask anything about your repository.</div>
+      <section class="transcript">
+        <div class="assistant">
+          <strong>Brick agent is ready.</strong> I can help you with anything on your system — install software, schedule cron jobs, manage services, read/write files, or answer quick questions. Just tell me what you need.
+          <br /><br />
+          Examples: <em>"install nginx via brew"</em> · <em>"show my cron jobs and add one that runs at midnight"</em> · <em>"what processes are listening on port 8080?"</em>
+        </div>
 
-      {#each transcript as item, idx}
-        {#if item.type === "user"}
-          <div class="user-msg">
-            {item.text}
-          </div>
-        {:else}
-          <div class="msg-container">
-            {#if item.type === "assistant"}
-              <div class="assistant">
-                <p>{item.text}</p>
-                {#if item.contextTrimmed}
-                  <span class="context-chip" title="Older context was trimmed to fit inside the LLM context window">Context Trimmed</span>
-                {/if}
-              </div>
-            {:else if item.type === "proposal"}
-              <div class="proposal">
-                <span class="risk">{item.riskTier}</span>
-                {#if editingIndex === idx}
-                  <input type="text" bind:value={editedCommand} class="edit-input" />
-                {:else}
-                  <code>{item.command}</code>
-                {/if}
-                <footer>
-                  {#if editingIndex === idx}
-                    <button on:click={() => saveEdit(idx)}><Check size={14} /> Save</button>
-                    <button on:click={() => editingIndex = -1}><X size={14} /> Cancel</button>
-                  {:else}
-                    <button on:click={() => approve(idx, item.command ?? "")} class="btn-approve"><Check size={14} /> Approve</button>
-                    <button on:click={() => startEdit(idx, item.command ?? "")}>Edit</button>
-                    <button on:click={() => reject(idx)} class="btn-reject"><X size={14} /> Reject</button>
+        {#each transcript as item, idx}
+          {#if item.type === "user"}
+            <div class="user-msg">
+              {item.text}
+            </div>
+          {:else}
+            <div class="msg-container">
+              {#if item.type === "assistant"}
+                <div class="assistant">
+                  <p>{item.text}</p>
+                  {#if item.contextTrimmed}
+                    <span class="context-chip" title="Older context was trimmed to fit inside the LLM context window">Context Trimmed</span>
                   {/if}
-                </footer>
-              </div>
-            {:else if item.type === "blocked"}
-              <div class="blocked">
-                <div class="blocked-header">
-                  <ShieldAlert size={16} /> <strong>Blocked</strong>
                 </div>
-                <code>{item.command}</code>
-                <p class="reason">{item.reason}</p>
-              </div>
-            {/if}
-          </div>
-        {/if}
-      {/each}
-    </section>
+              {:else if item.type === "proposal"}
+                <div class="proposal">
+                  <span class="risk">{item.riskTier}</span>
+                  {#if editingIndex === idx}
+                    <input type="text" bind:value={editedCommand} class="edit-input" />
+                  {:else}
+                    <code>{item.command}</code>
+                  {/if}
+                  <footer>
+                    {#if editingIndex === idx}
+                      <button on:click={() => saveEdit(idx)}><Check size={14} /> Save</button>
+                      <button on:click={() => editingIndex = -1}><X size={14} /> Cancel</button>
+                    {:else}
+                      <button on:click={() => approve(idx, item.command ?? "")} class="btn-approve"><Check size={14} /> Approve</button>
+                      <button on:click={() => startEdit(idx, item.command ?? "")}>Edit</button>
+                      <button on:click={() => reject(idx)} class="btn-reject"><X size={14} /> Reject</button>
+                    {/if}
+                  </footer>
+                </div>
+              {:else if item.type === "blocked"}
+                <div class="blocked">
+                  <div class="blocked-header">
+                    <ShieldAlert size={16} /> <strong>Blocked</strong>
+                  </div>
+                  <code>{item.command}</code>
+                  <p class="reason">{item.reason}</p>
+                </div>
+              {/if}
+            </div>
+          {/if}
+        {/each}
+      </section>
 
-    <footer>
-      <textarea
-        bind:value={message}
-        rows="2"
-        placeholder="Ask Brick..."
-        disabled={isStreaming}
-        on:keydown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            send();
-          }
-        }}
-      ></textarea>
-      {#if isStreaming}
-        <button on:click={cancel} class="btn-cancel"><Square size={14} /> Stop</button>
-      {:else}
-        <button on:click={send} class="btn-send"><Play size={14} /> Run</button>
-      {/if}
-    </footer>
-  </aside>
+      <footer>
+        <textarea
+          bind:value={message}
+          rows="2"
+          placeholder="Ask Brick..."
+          disabled={isStreaming}
+          on:keydown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              send();
+            }
+          }}
+        ></textarea>
+        {#if isStreaming}
+          <button on:click={cancel} class="btn-cancel"><Square size={14} /> Stop</button>
+        {:else}
+          <button on:click={send} class="btn-send"><Play size={14} /> Run</button>
+        {/if}
+      </footer>
+    </aside>
+  {:else}
+    <!-- Helpful side-panel empty state explaining what Agentic mode is -->
+    <aside class="agent-empty" style={`width:${width}px;`}>
+      <div class="empty-container">
+        <ShieldAlert size={36} class="muted-icon" />
+        <h3>Agentic Mode Disabled</h3>
+        <p>Switch your workspace to <strong>Agentic mode</strong> to use AI-assisted task execution, command rank suggestions, and autonomous terminal steps.</p>
+        <button on:click={onEnableAgentic} class="enable-btn">Enable Agentic Mode</button>
+      </div>
+    </aside>
+  {/if}
 {/if}
 
 <style>
+  .agent-empty {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    background: #181818;
+    border-left: 1px solid #2d2d2d;
+    box-sizing: border-box;
+    padding: 24px;
+    color: #aaaaaa;
+  }
+  .empty-container {
+    text-align: center;
+    max-width: 280px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+  .empty-container h3 {
+    font-size: 15px;
+    color: #ffffff;
+    margin: 0;
+  }
+  .empty-container p {
+    font-size: 12px;
+    line-height: 1.5;
+    margin: 0;
+  }
+  .muted-icon {
+    color: #444444;
+  }
+  .enable-btn {
+    background-color: #007acc;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+    font-weight: 500;
+    margin-top: 8px;
+  }
+  .enable-btn:hover {
+    background-color: #0062a3;
+  }
   .resize-handle {
     position: absolute;
     top: 0;

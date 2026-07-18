@@ -53,11 +53,28 @@ pub struct AgentOrchestrator {
 }
 
 const SYSTEM_PROMPT: &str = "\
-You are Brick, a local-first terminal agent on macOS.
-You help users by proposing and executing terminal commands.
-You have access to terminal tools.
-Output reasoning, followed by a tool call if you need to run a command.
-Do not make assumptions, inspect files or list directories if you need info.";
+You are Brick, a powerful general-purpose terminal agent running on macOS.
+You act as a senior systems engineer who can perform any task a user asks via the shell.
+
+Capabilities:
+- Install, configure, and manage software (brew, pip, npm, apt, etc.)
+- Read, write, and edit files and configuration (crontabs, nginx, etc.)
+- Inspect the environment: OS version, running processes, disk usage, network
+- Schedule cron jobs: fetch with `crontab -l`, update with `crontab -`
+- Manage system services: launchctl, systemctl, pm2
+- Run git, docker, terraform, and any CLI tool
+- Answer quick factual questions without running a command when the answer is known
+
+Behavior rules:
+- Always think step-by-step: if you need info before acting, use run_command to gather it first
+- Prefer read-only inspection commands before making changes
+- For destructive/modifying actions use run_command — the user will approve
+- For file reads or directory listings, prefer read_file or list_directory (no shell needed)
+- For file writes or edits, use write_file
+- Keep answers concise. For informational questions, reply in plain text without a tool call
+- Never make assumptions about paths or state — inspect first if unsure
+
+You are NOT limited to any specific project or repository. You can help with the entire system.";
 
 fn count_tokens(text: &str) -> usize {
     let bpe = tiktoken_rs::cl100k_base().ok();
@@ -175,21 +192,19 @@ impl AgentOrchestrator {
         let tools = vec![
             ToolDefinition {
                 name: "run_command".into(),
-                description: "Execute a shell command in the current pane's shell session.".into(),
+                description: "Execute any shell command in the active terminal session. Use this to install software, manage cron jobs (crontab -l / crontab -), inspect the OS, manage services, run scripts, etc. Arguments: {\"command\": string}".into(),
             },
             ToolDefinition {
                 name: "read_file".into(),
-                description: "Read the contents of a file in the workspace.".into(),
+                description: "Read the entire text content of a file at an absolute path. Prefer this over `cat` for reading config files, logs, scripts, etc. Arguments: {\"path\": string}".into(),
             },
             ToolDefinition {
                 name: "list_directory".into(),
-                description: "List the contents of a directory in the workspace.".into(),
+                description: "List all files and subdirectories at an absolute path. Arguments: {\"path\": string}".into(),
             },
             ToolDefinition {
                 name: "write_file".into(),
-                description:
-                    "Create a new file or write/overwrite content to a file in the workspace."
-                        .into(),
+                description: "Create or overwrite a file at an absolute path with the provided text content. Use for writing config files, scripts, crontab pipes, etc. Arguments: {\"path\": string, \"content\": string}".into(),
             },
         ];
 
@@ -302,95 +317,200 @@ impl AgentOrchestrator {
             }
         }
 
-        // 5. Handle tool call
+        // 5. Handle tool calls
         if let Some(tool_calls) = final_tool_calls {
             for tc in tool_calls {
-                if tc.name == "run_command" {
-                    // Extract command
-                    let parsed_args: serde_json::Value =
-                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
-                    let Some(command) =
-                        parsed_args.get("command").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    else {
-                        continue;
-                    };
+                let parsed_args: serde_json::Value =
+                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
 
-                    let tier = risk::classify(&command);
+                match tc.name.as_str() {
+                    "run_command" => {
+                        let Some(command) = parsed_args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                        else {
+                            continue;
+                        };
 
-                    match tier {
-                        RiskTier::Safe => {
-                            self.execute_safe_command(&pane_id, &command, &app, cancelled.clone())
+                        let tier = risk::classify(&command);
+
+                        match tier {
+                            RiskTier::Safe => {
+                                self.execute_safe_command(
+                                    &pane_id,
+                                    &command,
+                                    &app,
+                                    cancelled.clone(),
+                                )
                                 .await?;
-                        }
-                        RiskTier::Confirm => {
-                            let (tx, rx) = tokio::sync::oneshot::channel::<UserResponse>();
-                            self.pending_approvals
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(pane_id.clone(), tx);
+                            }
+                            RiskTier::Confirm => {
+                                let (tx, rx) = tokio::sync::oneshot::channel::<UserResponse>();
+                                self.pending_approvals
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(pane_id.clone(), tx);
 
-                            let _ = app.emit(
-                                "agent_proposed_command",
-                                serde_json::json!({
-                                    "pane_id": pane_id,
-                                    "command": command,
-                                    "risk_tier": "Confirm",
-                                }),
-                            );
+                                let _ = app.emit(
+                                    "agent_proposed_command",
+                                    serde_json::json!({
+                                        "pane_id": pane_id,
+                                        "command": command,
+                                        "risk_tier": "Confirm",
+                                    }),
+                                );
 
-                            // Await user response
-                            let response = match rx.await {
-                                Ok(resp) => resp,
-                                Err(_) => UserResponse::Reject,
-                            };
+                                let response = match rx.await {
+                                    Ok(resp) => resp,
+                                    Err(_) => UserResponse::Reject,
+                                };
 
-                            match response {
-                                UserResponse::Approve => {
-                                    self.execute_safe_command(
-                                        &pane_id,
-                                        &command,
-                                        &app,
-                                        cancelled.clone(),
-                                    )
-                                    .await?;
-                                }
-                                UserResponse::Edit(edited) => {
-                                    // re-classify
-                                    let new_tier = risk::classify(&edited);
-                                    if new_tier == RiskTier::Blocked {
-                                        let _ = app.emit("agent_blocked_command", serde_json::json!({
-                                            "pane_id": pane_id,
-                                            "command": edited,
-                                            "reason": "Edited command is blocked by risk classifier",
-                                        }));
-                                    } else {
+                                match response {
+                                    UserResponse::Approve => {
                                         self.execute_safe_command(
                                             &pane_id,
-                                            &edited,
+                                            &command,
                                             &app,
                                             cancelled.clone(),
                                         )
                                         .await?;
                                     }
-                                }
-                                UserResponse::Reject => {
-                                    let _ = app.emit(
-                                        "agent_turn_done",
-                                        serde_json::json!({ "pane_id": pane_id }),
-                                    );
+                                    UserResponse::Edit(edited) => {
+                                        let new_tier = risk::classify(&edited);
+                                        if new_tier == RiskTier::Blocked {
+                                            let _ = app.emit(
+                                                "agent_blocked_command",
+                                                serde_json::json!({
+                                                    "pane_id": pane_id,
+                                                    "command": edited,
+                                                    "reason": "Edited command is blocked by risk classifier",
+                                                }),
+                                            );
+                                        } else {
+                                            self.execute_safe_command(
+                                                &pane_id,
+                                                &edited,
+                                                &app,
+                                                cancelled.clone(),
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                    UserResponse::Reject => {
+                                        let _ = app.emit(
+                                            "agent_turn_done",
+                                            serde_json::json!({ "pane_id": pane_id }),
+                                        );
+                                    }
                                 }
                             }
+                            RiskTier::Blocked => {
+                                let _ = app.emit(
+                                    "agent_blocked_command",
+                                    serde_json::json!({
+                                        "pane_id": pane_id,
+                                        "command": command,
+                                        "reason": "Blocked by risk classifier",
+                                    }),
+                                );
+                            }
                         }
-                        RiskTier::Blocked => {
-                            let _ = app.emit(
-                                "agent_blocked_command",
-                                serde_json::json!({
-                                    "pane_id": pane_id,
-                                    "command": command,
-                                    "reason": "Blocked by risk classifier",
-                                }),
-                            );
-                        }
+                    }
+
+                    "read_file" => {
+                        let path = parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let result = if path.is_empty() {
+                            "Error: no path provided".to_string()
+                        } else {
+                            match std::fs::read_to_string(path) {
+                                Ok(content) => content,
+                                Err(e) => format!("Error reading file: {}", e),
+                            }
+                        };
+                        // Feed result back into context as a tool result and re-run
+                        let _ = app.emit(
+                            "agent_stream_chunk",
+                            serde_json::json!({
+                                "pane_id": pane_id,
+                                "delta": format!("\n[File: {}]\n{}\n", path, &result[..result.len().min(4000)]),
+                                "done": false,
+                                "context_trimmed": false,
+                            }),
+                        );
+                    }
+
+                    "list_directory" => {
+                        let path = parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                        let result = match std::fs::read_dir(path) {
+                            Ok(entries) => {
+                                let mut lines: Vec<String> = entries
+                                    .filter_map(|e| e.ok())
+                                    .map(|e| {
+                                        let name = e.file_name().to_string_lossy().to_string();
+                                        let is_dir =
+                                            e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                                        if is_dir {
+                                            format!("{}/", name)
+                                        } else {
+                                            name
+                                        }
+                                    })
+                                    .collect();
+                                lines.sort();
+                                lines.join("\n")
+                            }
+                            Err(e) => format!("Error listing directory: {}", e),
+                        };
+                        let _ = app.emit(
+                            "agent_stream_chunk",
+                            serde_json::json!({
+                                "pane_id": pane_id,
+                                "delta": format!("\n[Directory: {}]\n{}\n", path, result),
+                                "done": false,
+                                "context_trimmed": false,
+                            }),
+                        );
+                    }
+
+                    "write_file" => {
+                        let path = parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let content =
+                            parsed_args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        let result = if path.is_empty() {
+                            "Error: no path provided".to_string()
+                        } else {
+                            // Create parent directories if needed
+                            if let Some(parent) = std::path::Path::new(path).parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            match std::fs::write(path, content) {
+                                Ok(()) => format!("Written {} bytes to {}", content.len(), path),
+                                Err(e) => format!("Error writing file: {}", e),
+                            }
+                        };
+                        let _ = app.emit(
+                            "agent_stream_chunk",
+                            serde_json::json!({
+                                "pane_id": pane_id,
+                                "delta": format!("\n[{}]\n", result),
+                                "done": false,
+                                "context_trimmed": false,
+                            }),
+                        );
+                    }
+
+                    _ => {
+                        // Unknown tool — log and continue
+                        let _ = app.emit(
+                            "agent_stream_chunk",
+                            serde_json::json!({
+                                "pane_id": pane_id,
+                                "delta": format!("\n[Unknown tool: {}]\n", tc.name),
+                                "done": false,
+                                "context_trimmed": false,
+                            }),
+                        );
                     }
                 }
             }

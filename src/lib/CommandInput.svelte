@@ -42,8 +42,18 @@
 </script>
 
 <div class="command-input">
-  <div class="ghost"><span>{value}</span><em>{suffix}</em></div>
-  <input bind:value disabled={disabled} on:input={refresh} on:keydown={keydown} spellcheck="false" />
+  <span class="prompt-symbol">$</span>
+  <div class="input-wrapper">
+    <div class="ghost"><span>{value}</span><em>{suffix}</em></div>
+    <input 
+      bind:value 
+      disabled={disabled} 
+      on:input={refresh} 
+      on:keydown={keydown} 
+      spellcheck="false" 
+      placeholder="Type a command and press Enter..." 
+    />
+  </div>
   {#if suggestions.length > 1}
     <div class="suggestions">
       {#each suggestions as suggestion, i}
@@ -54,3 +64,82 @@
     </div>
   {/if}
 </div>
+
+<style>
+  .command-input {
+    display: flex;
+    align-items: center;
+    background-color: #1e1e1e;
+    border-top: 1px solid #2d2d2d;
+    padding: 8px 12px;
+    position: relative;
+    gap: 8px;
+  }
+  .prompt-symbol {
+    color: #0dbc79;
+    font-family: monospace;
+    font-weight: bold;
+    font-size: 14px;
+    user-select: none;
+  }
+  .input-wrapper {
+    position: relative;
+    flex: 1;
+    display: flex;
+    align-items: center;
+  }
+  input {
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: #ffffff;
+    font-family: monospace;
+    font-size: 13px;
+    padding: 4px 0;
+    outline: none;
+  }
+  input::placeholder {
+    color: #555555;
+  }
+  .ghost {
+    position: absolute;
+    left: 0;
+    top: 4px;
+    font-family: monospace;
+    font-size: 13px;
+    color: #555555;
+    pointer-events: none;
+    white-space: pre;
+  }
+  .ghost span {
+    visibility: hidden;
+  }
+  .suggestions {
+    position: absolute;
+    bottom: 100%;
+    left: 28px;
+    right: 12px;
+    background-color: #252526;
+    border: 1px solid #3c3c3c;
+    border-radius: 4px;
+    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.5);
+    z-index: 100;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .suggestions button {
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: #cccccc;
+    padding: 6px 12px;
+    font-family: monospace;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .suggestions button.active, .suggestions button:hover {
+    background-color: #37373d;
+    color: #ffffff;
+  }
+</style>

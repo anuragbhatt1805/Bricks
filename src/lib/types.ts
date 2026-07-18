@@ -16,3 +16,16 @@ export interface SuggestedCommand {
   run_count: number;
   cwd_local: boolean;
 }
+
+export interface LlmBackendConfig {
+  id: string;
+  name: string;
+  kind: "openai" | "bedrock";
+  base_url: string | null;
+  model: string;
+  api_key_ref: string | null;
+  is_default: boolean;
+  is_local: boolean;
+  created_at: number;
+  context_window_tokens: number;
+}
