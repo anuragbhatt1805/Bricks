@@ -78,4 +78,4 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeDebug: false
-          tauriScript: cargo tauri
+          tauriScript: yarn tauri
