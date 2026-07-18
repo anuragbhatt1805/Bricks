@@ -214,38 +214,6 @@ impl AgentOrchestrator {
             floor_tokens += count_tokens(&t.description) + count_tokens(&t.name);
         }
 
-        let mut budget = if context_window_tokens > floor_tokens as i64 {
-            context_window_tokens - floor_tokens as i64
-        } else {
-            1000
-        };
-
-        let mut context_trimmed = false;
-        let mut assembled_blocks = Vec::new();
-
-        let blocks = self.db.recent_blocks(&pane_id, 50).await.unwrap_or_default();
-        for block in blocks {
-            let mut block_text = format_block(&block);
-            let mut tokens = count_tokens(&block_text);
-            if tokens > 1000 {
-                let stdout = block.stdout.clone().unwrap_or_default();
-                let truncated_stdout = truncate_block_output(&stdout, 2000);
-                let mut truncated_block = block.clone();
-                truncated_block.stdout = Some(truncated_stdout);
-                block_text = format_block(&truncated_block);
-                tokens = count_tokens(&block_text);
-                context_trimmed = true;
-            }
-            if budget >= tokens as i64 {
-                budget -= tokens as i64;
-                assembled_blocks.push(block_text);
-            } else {
-                context_trimmed = true;
-                break;
-            }
-        }
-        assembled_blocks.reverse();
-
         // Load chat history from agent session
         let mut messages = Vec::new();
         if let Ok(Some(session_json)) = self.db.get_agent_session(&pane_id).await {
@@ -254,265 +222,329 @@ impl AgentOrchestrator {
             }
         }
 
-        // Add system message and current message
-        let redacted_system = redact::redact(&format!(
-            "{}\n\nRecent terminal history:\n{}",
-            SYSTEM_PROMPT,
-            assembled_blocks.join("\n")
-        ));
+        // Append initial user message
         let redacted_user = redact::redact(&user_message);
-
-        messages.push(ChatMessage { role: "system".into(), content: redacted_system.output });
         messages.push(ChatMessage { role: "user".into(), content: redacted_user.output });
 
-        // 4. Stream chunks
-        let mut stream = backend
-            .chat_stream(messages.clone(), tools.clone())
-            .await
-            .map_err(|e| AgentError::Llm(e.to_string()))?;
+        let mut loop_count = 0;
+        let mut context_trimmed = false;
 
-        let mut full_assistant_response = String::new();
-        let mut final_tool_calls = None;
+        loop {
+            if loop_count >= 10 {
+                break;
+            }
+            loop_count += 1;
 
-        while let Some(chunk_res) = futures::StreamExt::next(&mut stream).await {
             if cancelled.load(Ordering::Relaxed) {
                 let _ = app.emit("agent_cancelled", serde_json::json!({ "pane_id": pane_id }));
                 return Ok(());
             }
 
-            let chunk = match chunk_res {
-                Ok(c) => c,
+            // Re-assemble recent terminal blocks (changes as commands are run!)
+            let mut assembled_blocks = Vec::new();
+            let mut budget = if context_window_tokens > floor_tokens as i64 {
+                context_window_tokens - floor_tokens as i64
+            } else {
+                1000
+            };
+
+            let blocks = self.db.recent_blocks(&pane_id, 50).await.unwrap_or_default();
+            for block in blocks {
+                let mut block_text = format_block(&block);
+                let mut tokens = count_tokens(&block_text);
+                if tokens > 1000 {
+                    let stdout = block.stdout.clone().unwrap_or_default();
+                    let truncated_stdout = truncate_block_output(&stdout, 2000);
+                    let mut truncated_block = block.clone();
+                    truncated_block.stdout = Some(truncated_stdout);
+                    block_text = format_block(&truncated_block);
+                    tokens = count_tokens(&block_text);
+                    context_trimmed = true;
+                }
+                if budget >= tokens as i64 {
+                    budget -= tokens as i64;
+                    assembled_blocks.push(block_text);
+                } else {
+                    context_trimmed = true;
+                    break;
+                }
+            }
+            assembled_blocks.reverse();
+
+            let redacted_system = redact::redact(&format!(
+                "{}\n\nRecent terminal history:\n{}",
+                SYSTEM_PROMPT,
+                assembled_blocks.join("\n")
+            ));
+
+            let mut request_messages =
+                vec![ChatMessage { role: "system".into(), content: redacted_system.output }];
+            request_messages.extend(messages.clone());
+
+            // Stream chunks
+            let mut stream = match backend.chat_stream(request_messages, tools.clone()).await {
+                Ok(s) => s,
                 Err(e) => return Err(AgentError::Llm(e.to_string())),
             };
 
-            if !chunk.content.is_empty() {
-                full_assistant_response.push_str(&chunk.content);
-                let _ = app.emit(
-                    "agent_stream_chunk",
-                    serde_json::json!({
-                        "pane_id": pane_id,
-                        "delta": chunk.content,
-                        "done": false,
-                        "context_trimmed": context_trimmed,
-                    }),
-                );
+            let mut full_assistant_response = String::new();
+            let mut final_tool_calls = None;
+
+            while let Some(chunk_res) = futures::StreamExt::next(&mut stream).await {
+                if cancelled.load(Ordering::Relaxed) {
+                    let _ = app.emit("agent_cancelled", serde_json::json!({ "pane_id": pane_id }));
+                    return Ok(());
+                }
+
+                let chunk = match chunk_res {
+                    Ok(c) => c,
+                    Err(e) => return Err(AgentError::Llm(e.to_string())),
+                };
+
+                if !chunk.content.is_empty() {
+                    full_assistant_response.push_str(&chunk.content);
+                    let _ = app.emit(
+                        "agent_stream_chunk",
+                        serde_json::json!({
+                            "pane_id": pane_id,
+                            "delta": chunk.content,
+                            "done": false,
+                            "context_trimmed": context_trimmed,
+                        }),
+                    );
+                }
+
+                if chunk.done {
+                    final_tool_calls = chunk.tool_calls;
+                    break;
+                }
             }
 
-            if chunk.done {
-                final_tool_calls = chunk.tool_calls;
-                break;
+            // Save assistant text to session if we received text
+            if !full_assistant_response.is_empty() {
+                let redacted_assistant = redact::redact(&full_assistant_response);
+                messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: redacted_assistant.output,
+                });
+                if let Ok(json) = serde_json::to_string(&messages) {
+                    let _ = self.db.save_agent_session(&pane_id, &json).await;
+                }
             }
-        }
 
-        // Save assistant text to session if we received text
-        if !full_assistant_response.is_empty() {
-            let redacted_assistant = redact::redact(&full_assistant_response);
-            messages
-                .push(ChatMessage { role: "assistant".into(), content: redacted_assistant.output });
-            // strip system message from history to save space
-            let save_messages: Vec<ChatMessage> =
-                messages.iter().filter(|m| m.role != "system").cloned().collect();
-            if let Ok(json) = serde_json::to_string(&save_messages) {
-                let _ = self.db.save_agent_session(&pane_id, &json).await;
-            }
-        }
+            // Handle tool calls
+            if let Some(tool_calls) = final_tool_calls {
+                if tool_calls.is_empty() {
+                    break;
+                }
 
-        // 5. Handle tool calls
-        if let Some(tool_calls) = final_tool_calls {
-            for tc in tool_calls {
-                let parsed_args: serde_json::Value =
-                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                let mut tool_results = Vec::new();
+                for tc in tool_calls {
+                    let parsed_args: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
 
-                match tc.name.as_str() {
-                    "run_command" => {
-                        let Some(command) = parsed_args
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                        else {
-                            continue;
-                        };
+                    let result = match tc.name.as_str() {
+                        "run_command" => {
+                            let Some(command) = parsed_args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                            else {
+                                continue;
+                            };
 
-                        let tier = risk::classify(&command);
+                            let tier = risk::classify(&command);
 
-                        match tier {
-                            RiskTier::Safe => {
-                                self.execute_safe_command(
-                                    &pane_id,
-                                    &command,
-                                    &app,
-                                    cancelled.clone(),
-                                )
-                                .await?;
-                            }
-                            RiskTier::Confirm => {
-                                let (tx, rx) = tokio::sync::oneshot::channel::<UserResponse>();
-                                self.pending_approvals
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .insert(pane_id.clone(), tx);
+                            match tier {
+                                RiskTier::Safe => {
+                                    self.execute_safe_command(
+                                        &pane_id,
+                                        &command,
+                                        &app,
+                                        cancelled.clone(),
+                                    )
+                                    .await?
+                                }
+                                RiskTier::Confirm => {
+                                    let (tx, rx) = tokio::sync::oneshot::channel::<UserResponse>();
+                                    self.pending_approvals
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(pane_id.clone(), tx);
 
-                                let _ = app.emit(
-                                    "agent_proposed_command",
-                                    serde_json::json!({
-                                        "pane_id": pane_id,
-                                        "command": command,
-                                        "risk_tier": "Confirm",
-                                    }),
-                                );
+                                    let _ = app.emit(
+                                        "agent_proposed_command",
+                                        serde_json::json!({
+                                            "pane_id": pane_id,
+                                            "command": command,
+                                            "risk_tier": "Confirm",
+                                        }),
+                                    );
 
-                                let response = match rx.await {
-                                    Ok(resp) => resp,
-                                    Err(_) => UserResponse::Reject,
-                                };
+                                    let response = match rx.await {
+                                        Ok(resp) => resp,
+                                        Err(_) => UserResponse::Reject,
+                                    };
 
-                                match response {
-                                    UserResponse::Approve => {
-                                        self.execute_safe_command(
-                                            &pane_id,
-                                            &command,
-                                            &app,
-                                            cancelled.clone(),
-                                        )
-                                        .await?;
-                                    }
-                                    UserResponse::Edit(edited) => {
-                                        let new_tier = risk::classify(&edited);
-                                        if new_tier == RiskTier::Blocked {
-                                            let _ = app.emit(
-                                                "agent_blocked_command",
-                                                serde_json::json!({
-                                                    "pane_id": pane_id,
-                                                    "command": edited,
-                                                    "reason": "Edited command is blocked by risk classifier",
-                                                }),
-                                            );
-                                        } else {
+                                    match response {
+                                        UserResponse::Approve => {
                                             self.execute_safe_command(
                                                 &pane_id,
-                                                &edited,
+                                                &command,
                                                 &app,
                                                 cancelled.clone(),
                                             )
-                                            .await?;
+                                            .await?
                                         }
-                                    }
-                                    UserResponse::Reject => {
-                                        let _ = app.emit(
-                                            "agent_turn_done",
-                                            serde_json::json!({ "pane_id": pane_id }),
-                                        );
+                                        UserResponse::Edit(edited) => {
+                                            let new_tier = risk::classify(&edited);
+                                            if new_tier == RiskTier::Blocked {
+                                                let msg =
+                                                    "Edited command is blocked by risk classifier"
+                                                        .to_string();
+                                                let _ = app.emit(
+                                                    "agent_blocked_command",
+                                                    serde_json::json!({
+                                                        "pane_id": pane_id,
+                                                        "command": edited,
+                                                        "reason": &msg,
+                                                    }),
+                                                );
+                                                msg
+                                            } else {
+                                                self.execute_safe_command(
+                                                    &pane_id,
+                                                    &edited,
+                                                    &app,
+                                                    cancelled.clone(),
+                                                )
+                                                .await?
+                                            }
+                                        }
+                                        UserResponse::Reject => {
+                                            "Command rejected by user".to_string()
+                                        }
                                     }
                                 }
-                            }
-                            RiskTier::Blocked => {
-                                let _ = app.emit(
-                                    "agent_blocked_command",
-                                    serde_json::json!({
-                                        "pane_id": pane_id,
-                                        "command": command,
-                                        "reason": "Blocked by risk classifier",
-                                    }),
-                                );
+                                RiskTier::Blocked => {
+                                    let msg = "Blocked by risk classifier".to_string();
+                                    let _ = app.emit(
+                                        "agent_blocked_command",
+                                        serde_json::json!({
+                                            "pane_id": pane_id,
+                                            "command": command,
+                                            "reason": &msg,
+                                        }),
+                                    );
+                                    msg
+                                }
                             }
                         }
-                    }
 
-                    "read_file" => {
-                        let path = parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        let result = if path.is_empty() {
-                            "Error: no path provided".to_string()
-                        } else {
-                            match std::fs::read_to_string(path) {
-                                Ok(content) => content,
-                                Err(e) => format!("Error reading file: {}", e),
-                            }
-                        };
-                        // Feed result back into context as a tool result and re-run
-                        let _ = app.emit(
-                            "agent_stream_chunk",
-                            serde_json::json!({
-                                "pane_id": pane_id,
-                                "delta": format!("\n[File: {}]\n{}\n", path, &result[..result.len().min(4000)]),
-                                "done": false,
-                                "context_trimmed": false,
-                            }),
-                        );
-                    }
+                        "read_file" => {
+                            let path =
+                                parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            let result = if path.is_empty() {
+                                "Error: no path provided".to_string()
+                            } else {
+                                match std::fs::read_to_string(path) {
+                                    Ok(content) => content,
+                                    Err(e) => format!("Error reading file: {}", e),
+                                }
+                            };
+                            let _ = app.emit(
+                                "agent_stream_chunk",
+                                serde_json::json!({
+                                    "pane_id": pane_id,
+                                    "delta": format!("\n[File: {}]\n{}\n", path, &result[..result.len().min(4000)]),
+                                    "done": false,
+                                    "context_trimmed": false,
+                                }),
+                            );
+                            result
+                        }
 
-                    "list_directory" => {
-                        let path = parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                        let result = match std::fs::read_dir(path) {
-                            Ok(entries) => {
-                                let mut lines: Vec<String> = entries
-                                    .filter_map(|e| e.ok())
-                                    .map(|e| {
-                                        let name = e.file_name().to_string_lossy().to_string();
-                                        let is_dir =
-                                            e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                                        if is_dir {
-                                            format!("{}/", name)
-                                        } else {
-                                            name
-                                        }
-                                    })
-                                    .collect();
-                                lines.sort();
-                                lines.join("\n")
-                            }
-                            Err(e) => format!("Error listing directory: {}", e),
-                        };
-                        let _ = app.emit(
-                            "agent_stream_chunk",
-                            serde_json::json!({
-                                "pane_id": pane_id,
-                                "delta": format!("\n[Directory: {}]\n{}\n", path, result),
-                                "done": false,
-                                "context_trimmed": false,
-                            }),
-                        );
-                    }
+                        "list_directory" => {
+                            let path =
+                                parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                            let result = match std::fs::read_dir(path) {
+                                Ok(entries) => {
+                                    let mut lines: Vec<String> = entries
+                                        .filter_map(|e| e.ok())
+                                        .map(|e| {
+                                            let name = e.file_name().to_string_lossy().to_string();
+                                            let is_dir =
+                                                e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                                            if is_dir {
+                                                format!("{}/", name)
+                                            } else {
+                                                name
+                                            }
+                                        })
+                                        .collect();
+                                    lines.sort();
+                                    lines.join("\n")
+                                }
+                                Err(e) => format!("Error listing directory: {}", e),
+                            };
+                            let _ = app.emit(
+                                "agent_stream_chunk",
+                                serde_json::json!({
+                                    "pane_id": pane_id,
+                                    "delta": format!("\n[Directory: {}]\n{}\n", path, result),
+                                    "done": false,
+                                    "context_trimmed": false,
+                                }),
+                            );
+                            result
+                        }
 
-                    "write_file" => {
-                        let path = parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        let content =
-                            parsed_args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                        let result = if path.is_empty() {
-                            "Error: no path provided".to_string()
-                        } else {
-                            // Create parent directories if needed
-                            if let Some(parent) = std::path::Path::new(path).parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            match std::fs::write(path, content) {
-                                Ok(()) => format!("Written {} bytes to {}", content.len(), path),
-                                Err(e) => format!("Error writing file: {}", e),
-                            }
-                        };
-                        let _ = app.emit(
-                            "agent_stream_chunk",
-                            serde_json::json!({
-                                "pane_id": pane_id,
-                                "delta": format!("\n[{}]\n", result),
-                                "done": false,
-                                "context_trimmed": false,
-                            }),
-                        );
-                    }
+                        "write_file" => {
+                            let path =
+                                parsed_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            let content =
+                                parsed_args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let result = if path.is_empty() {
+                                "Error: no path provided".to_string()
+                            } else {
+                                if let Some(parent) = std::path::Path::new(path).parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                match std::fs::write(path, content) {
+                                    Ok(()) => {
+                                        format!("Written {} bytes to {}", content.len(), path)
+                                    }
+                                    Err(e) => format!("Error writing file: {}", e),
+                                }
+                            };
+                            let _ = app.emit(
+                                "agent_stream_chunk",
+                                serde_json::json!({
+                                    "pane_id": pane_id,
+                                    "delta": format!("\n[{}]\n", result),
+                                    "done": false,
+                                    "context_trimmed": false,
+                                }),
+                            );
+                            result
+                        }
 
-                    _ => {
-                        // Unknown tool — log and continue
-                        let _ = app.emit(
-                            "agent_stream_chunk",
-                            serde_json::json!({
-                                "pane_id": pane_id,
-                                "delta": format!("\n[Unknown tool: {}]\n", tc.name),
-                                "done": false,
-                                "context_trimmed": false,
-                            }),
-                        );
-                    }
+                        _ => format!("Error: unknown tool '{}'", tc.name),
+                    };
+
+                    tool_results.push(format!("[Tool result for '{}']\n{}", tc.name, result));
                 }
+
+                // Add the tool results as a user message in history
+                let tool_message = tool_results.join("\n\n");
+                let redacted_tool = redact::redact(&tool_message);
+                messages.push(ChatMessage { role: "user".into(), content: redacted_tool.output });
+                if let Ok(json) = serde_json::to_string(&messages) {
+                    let _ = self.db.save_agent_session(&pane_id, &json).await;
+                }
+            } else {
+                // No tool calls — LLM finished its task!
+                break;
             }
         }
 
@@ -536,7 +568,7 @@ impl AgentOrchestrator {
         command: &str,
         app: &AppHandle,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<String, AgentError> {
         let start_time = chrono::Utc::now().timestamp_millis();
 
         // Listen to output in real-time
@@ -588,6 +620,7 @@ impl AgentOrchestrator {
             tokio::select! {
                 _ = &mut watchdog => {
                     let _ = app.emit("agent_autorun_timeout", serde_json::json!({ "pane_id": pane_id }));
+                    break;
                 }
                 _ = check_interval.tick() => {
                     if cancelled.load(Ordering::Relaxed) {
@@ -606,18 +639,19 @@ impl AgentOrchestrator {
 
         app.unlisten(listener_id);
 
+        let output_str =
+            if let Ok(buf) = output_buffer.lock() { buf.clone() } else { String::new() };
+
         // Feed stdout/stderr of executed command back into database block
         if let Some(ref block) = block_output {
-            let output_str =
-                if let Ok(buf) = output_buffer.lock() { buf.clone() } else { String::new() };
             // update database block with stdout
             let mut updated_block = block.clone();
-            updated_block.stdout = Some(output_str);
+            updated_block.stdout = Some(output_str.clone());
             updated_block.initiated_by = "agent".into();
             let _ = self.db.insert_block(updated_block).await;
         }
 
-        Ok(())
+        Ok(output_str)
     }
 }
 

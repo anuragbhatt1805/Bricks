@@ -169,12 +169,12 @@
         isStreaming = true;
         let lastIdx = transcript.length - 1;
         if (lastIdx >= 0 && transcript[lastIdx].type === "assistant" && !transcript[lastIdx].done) {
-          transcript[lastIdx].text += payload.chunk;
+          transcript[lastIdx].text += payload.delta;
           transcript = [...transcript];
         } else {
           transcript = [...transcript, {
             type: "assistant",
-            text: payload.chunk,
+            text: payload.delta,
             done: false,
           }];
         }
