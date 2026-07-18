@@ -20,12 +20,12 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:;"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": ["app", "dmg"],
     "icon": []
   }
 }

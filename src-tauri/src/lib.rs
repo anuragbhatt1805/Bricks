@@ -23,6 +23,8 @@ use tokio::sync::RwLock;
 pub struct AppState {
     pub db: Arc<Database>,
     pub pty: Arc<PtyManager>,
+    pub backend_registry: Arc<RwLock<llm::BackendRegistry>>,
+    pub orchestrator: Arc<agent::AgentOrchestrator>,
     pub app_data_dir: PathBuf,
 }
 
@@ -133,6 +135,15 @@ async fn set_setting(
 }
 
 #[tauri::command]
+async fn list_backends(
+    state: State<'_, Arc<RwLock<Option<AppState>>>>,
+) -> Result<Vec<database::LlmBackendConfig>, String> {
+    let state = state.read().await;
+    let state = state.as_ref().ok_or("app state not ready")?;
+    state.db.list_backends().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn redact_text(input: String) -> redact::RedactResult {
     redact::redact(&input)
 }
@@ -152,7 +163,20 @@ pub fn run() {
             let db = tauri::async_runtime::block_on(Database::open(db_path))?;
             let db = Arc::new(db);
             let pty = Arc::new(PtyManager::default());
-            let app_state = AppState { db: db.clone(), pty, app_data_dir: app_data_dir.clone() };
+            let registry = tauri::async_runtime::block_on(llm::BackendRegistry::load(&db))?;
+            let backend_registry = Arc::new(RwLock::new(registry));
+            let orchestrator = Arc::new(agent::AgentOrchestrator::new(
+                db.clone(),
+                pty.clone(),
+                backend_registry.clone(),
+            ));
+            let app_state = AppState {
+                db: db.clone(),
+                pty,
+                backend_registry,
+                orchestrator,
+                app_data_dir: app_data_dir.clone(),
+            };
             let pending_state = pending_state.clone();
             tauri::async_runtime::block_on(async move {
                 *pending_state.write().await = Some(app_state);
@@ -171,7 +195,14 @@ pub fn run() {
             suggest_command,
             get_setting,
             set_setting,
-            redact_text
+            redact_text,
+            list_backends,
+            llm::test_backend_connection,
+            agent::agent_run_turn,
+            agent::agent_approve_command,
+            agent::agent_reject_command,
+            agent::cancel_agent_turn,
+            agent::send_signal
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| eprintln!("error while running Brick: {error}"));

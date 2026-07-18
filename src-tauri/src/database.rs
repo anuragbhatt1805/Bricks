@@ -28,6 +28,8 @@ pub struct Block {
     pub shell: String,
     pub initiated_by: String,
     pub is_interactive: bool,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,8 +109,8 @@ impl Database {
         conn.execute(
             "INSERT INTO blocks(
               id, pane_id, command, cwd, exit_code, duration_ms, started_at,
-              git_branch, git_dirty, shell, initiated_by, is_interactive
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              git_branch, git_dirty, shell, initiated_by, is_interactive, stdout, stderr
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 block.id,
                 block.pane_id,
@@ -121,7 +123,9 @@ impl Database {
                 i32::from(block.git_dirty),
                 block.shell,
                 block.initiated_by,
-                i32::from(block.is_interactive)
+                i32::from(block.is_interactive),
+                block.stdout,
+                block.stderr
             ],
         )?;
         Ok(block.id)
@@ -145,7 +149,7 @@ impl Database {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, pane_id, command, cwd, exit_code, duration_ms, started_at,
-                    git_branch, git_dirty, shell, initiated_by, is_interactive
+                    git_branch, git_dirty, shell, initiated_by, is_interactive, stdout, stderr
              FROM blocks
              WHERE command LIKE ?1 OR cwd LIKE ?1
              ORDER BY started_at DESC
@@ -159,7 +163,7 @@ impl Database {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, pane_id, command, cwd, exit_code, duration_ms, started_at,
-                    git_branch, git_dirty, shell, initiated_by, is_interactive
+                    git_branch, git_dirty, shell, initiated_by, is_interactive, stdout, stderr
              FROM blocks WHERE pane_id = ?1 ORDER BY started_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pane_id, limit as i64], row_to_block)?;
@@ -263,6 +267,139 @@ impl Database {
             .optional()?;
         Ok(raw.as_deref().map(mode_from_db))
     }
+
+    pub async fn get_agent_session(&self, pane_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT transcript_json FROM agent_sessions WHERE pane_id = ?1",
+            params![pane_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub async fn save_agent_session(
+        &self,
+        pane_id: &str,
+        transcript_json: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().timestamp_millis();
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT id FROM agent_sessions WHERE pane_id = ?1",
+                params![pane_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(sid) = exists {
+            conn.execute(
+                "UPDATE agent_sessions SET transcript_json = ?2, updated_at = ?3 WHERE id = ?1",
+                params![sid, transcript_json, now],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO agent_sessions(id, pane_id, transcript_json, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?4)",
+                params![Uuid::new_v4().to_string(), pane_id, transcript_json, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_default_backend(&self) -> anyhow::Result<Option<LlmBackendConfig>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT id, name, kind, base_url, model, api_key_ref, is_default, is_local, created_at, context_window_tokens
+             FROM llm_backends WHERE is_default = 1",
+            params![],
+            row_to_backend_config,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub async fn get_backend_by_id(&self, id: &str) -> anyhow::Result<Option<LlmBackendConfig>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT id, name, kind, base_url, model, api_key_ref, is_default, is_local, created_at, context_window_tokens
+             FROM llm_backends WHERE id = ?1",
+            params![id],
+            row_to_backend_config,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub async fn list_backends(&self) -> anyhow::Result<Vec<LlmBackendConfig>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind, base_url, model, api_key_ref, is_default, is_local, created_at, context_window_tokens
+             FROM llm_backends ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![], row_to_backend_config)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub async fn insert_backend(&self, config: LlmBackendConfig) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO llm_backends(
+              id, name, kind, base_url, model, api_key_ref, is_default, is_local, created_at, context_window_tokens
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                config.id,
+                config.name,
+                match config.kind {
+                    crate::llm::BackendKind::OpenAiCompatible => "openai",
+                    crate::llm::BackendKind::Bedrock => "bedrock",
+                },
+                config.base_url,
+                config.model,
+                config.api_key_ref,
+                i32::from(config.is_default),
+                i32::from(config.is_local),
+                config.created_at,
+                config.context_window_tokens
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmBackendConfig {
+    pub id: String,
+    pub name: String,
+    pub kind: crate::llm::BackendKind,
+    pub base_url: Option<String>,
+    pub model: String,
+    pub api_key_ref: Option<String>,
+    pub is_default: bool,
+    pub is_local: bool,
+    pub created_at: i64,
+    pub context_window_tokens: i64,
+}
+
+fn row_to_backend_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmBackendConfig> {
+    let kind_str: String = row.get(2)?;
+    let kind = match kind_str.as_str() {
+        "bedrock" => crate::llm::BackendKind::Bedrock,
+        _ => crate::llm::BackendKind::OpenAiCompatible,
+    };
+    Ok(LlmBackendConfig {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind,
+        base_url: row.get(3)?,
+        model: row.get(4)?,
+        api_key_ref: row.get(5)?,
+        is_default: row.get::<_, i32>(6)? != 0,
+        is_local: row.get::<_, i32>(7)? != 0,
+        created_at: row.get(8)?,
+        context_window_tokens: row.get(9)?,
+    })
 }
 
 fn row_to_block(row: &rusqlite::Row<'_>) -> rusqlite::Result<Block> {
@@ -279,6 +416,8 @@ fn row_to_block(row: &rusqlite::Row<'_>) -> rusqlite::Result<Block> {
         shell: row.get(9)?,
         initiated_by: row.get(10)?,
         is_interactive: row.get::<_, i32>(11)? != 0,
+        stdout: row.get(12)?,
+        stderr: row.get(13)?,
     })
 }
 
@@ -324,6 +463,8 @@ mod tests {
             shell: "zsh".into(),
             initiated_by: "user".into(),
             is_interactive: false,
+            stdout: None,
+            stderr: None,
         })
         .await
         .unwrap();

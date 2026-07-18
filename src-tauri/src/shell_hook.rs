@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +28,10 @@ pub async fn serve(path: PathBuf, db: Arc<Database>, app: AppHandle) {
         let _ = std::fs::create_dir_all(parent);
     }
     let listener = match UnixListener::bind(&path) {
-        Ok(listener) => listener,
+        Ok(listener) => {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+            listener
+        }
         Err(error) => {
             eprintln!("failed to bind shell hook socket {}: {error}", path.display());
             return;
@@ -67,6 +71,8 @@ async fn handle_stream(stream: UnixStream, db: Arc<Database>, app: AppHandle) {
             shell: payload.shell,
             initiated_by: "user".into(),
             is_interactive: false,
+            stdout: None,
+            stderr: None,
         };
         if let Ok(block_id) = db.insert_block(block).await {
             let _ = db.upsert_command_frequency(&payload.command, &payload.cwd).await;

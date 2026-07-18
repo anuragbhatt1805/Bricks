@@ -92,5 +92,5 @@
     {/if}
   </section>
 
-  <AgentPanel visible={showAgent && mode === "agentic"} backendName="Local backend" local={true} />
+  <AgentPanel visible={showAgent && mode === "agentic"} {paneId} />
 </main>

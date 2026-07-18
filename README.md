@@ -1,84 +1,76 @@
-# Brick
+<div align="center">
 
-Brick is a macOS-only, local-first terminal emulator built with Tauri v2, Rust,
-Svelte, TypeScript, and Vite.
+# 🧱 Brick
 
-## Prerequisites
+**A local-first, AI-assisted terminal emulator for macOS.**
 
-- macOS with Xcode Command Line Tools (`xcode-select -p`)
-- Rust stable
-- Node.js and Yarn
-- Tauri CLI v2 (`cargo install tauri-cli --version "^2" --locked`)
+[![CI](https://github.com/anuragbhatt1805/brick/actions/workflows/ci.yml/badge.svg)](https://github.com/anuragbhatt1805/brick/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/platform-macOS%2012%2B-lightgrey?logo=apple)](https://www.apple.com/macos/)
+[![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 
-## Development
+</div>
+
+---
+
+Brick is a macOS terminal emulator built on [Tauri v2](https://tauri.app/), Rust, Svelte, and SQLite. It logs every command you run locally, gives you AI-assisted suggestions powered by a model of your choice (Ollama, OpenAI-compatible, or AWS Bedrock), and executes agent tasks with a human-in-the-loop approval gate — all without sending a single byte to the cloud unless you explicitly configure it to.
+
+## ✨ Features
+
+- **Full PTY terminal** — native shell sessions with resize support
+- **Local-first history** — every block (command + output + metadata) stored in SQLite on your machine
+- **AI Agent mode** — natural-language task execution with risk classification and per-command approval
+- **Multi-backend LLM** — plug in Ollama, any OpenAI-compatible endpoint, or AWS Bedrock
+- **Secret redaction** — API keys and tokens scrubbed from prompts before they reach the LLM
+- **Zero telemetry** — no analytics, no cloud sync, no phone home
+
+## 📦 Download & Install
+
+Pre-built `.dmg` releases are available on the [Releases page](https://github.com/anuragbhatt1805/brick/releases).
+
+| Architecture | File |
+|---|---|
+| Apple Silicon (M1/M2/M3) | `Brick_vX.Y.Z_aarch64.dmg` |
+| Intel | `Brick_vX.Y.Z_x64.dmg` |
+
+### Installation steps
+
+1. Download the `.dmg` for your chip and open it
+2. Drag **Brick.app** to your **Applications** folder
+3. On first launch, macOS Gatekeeper will block the app with a warning like *"Apple cannot verify this app"* — this is expected for apps distributed outside the App Store
+
+**To allow Brick to run:**
+
+> **System Settings → Privacy & Security** → scroll down → click **"Open Anyway"** next to Brick
+
+You'll only need to do this once. After that, Brick launches normally.
+
+> Requires **macOS 12 Monterey** or later.
+
+## 🚀 Quick Start (Development)
+
+See [SETUP.md](SETUP.md) for the full local development guide.
 
 ```sh
+# Clone
+git clone https://github.com/anuragbhatt1805/brick.git
+cd brick
+
+# Install dependencies
 yarn install
-cargo build --workspace
-yarn dev
+
+# Start dev server (Rust + Svelte hot-reload)
 cargo tauri dev
 ```
 
-The development window is titled `Brick` and uses `/bin/zsh` as the primary
-shell.
+## 🏗️ Architecture
 
-## Shell Hook
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the codebase structure, data flow, and component responsibilities.
 
-Brick includes a zsh hook at `scripts/brick_hook.zsh`. The app sets
-`BRICK_PANE_ID` and `BRICK_SHELL_SOCKET` for spawned shells. To install manually:
+## 🤝 Contributing
 
-```sh
-mkdir -p ~/.config/brick
-cp scripts/brick_hook.zsh ~/.config/brick/brick_hook.zsh
-printf '\nsource ~/.config/brick/brick_hook.zsh\n' >> ~/.zshrc
-```
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow — from setting up your dev environment to submitting a PR.
 
-The hook reports command blocks to:
+## 📄 License
 
-```text
-~/Library/Application Support/dev.brick.app/shell.sock
-```
-
-## Local Data
-
-Brick stores SQLite data locally at:
-
-```text
-~/Library/Application Support/dev.brick.app/brick.db
-```
-
-There is no forced cloud dependency. Normal workspace mode is the default and
-agentic calls are blocked by the Rust core guard.
-
-## Ollama Backend
-
-Backend persistence is scaffolded in `llm_backends`. For an Ollama-compatible
-backend, use a local base URL such as:
-
-```text
-http://localhost:11434
-```
-
-The full streaming adapter and connection test flow are represented by core
-types and UI placeholders in this scaffold, with no outbound call made unless
-an agentic backend is explicitly configured and invoked.
-
-## Verification
-
-```sh
-yarn test
-yarn build
-yarn run check
-cargo build --workspace
-cargo test --workspace
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
-```
-
-## Known Limitations
-
-- v1 implementation is scaffolded and tested for the core local-first spine.
-- Full `alacritty_terminal`-backed rendering, LLM streaming adapters, Playwright
-  E2E, spill reaper, and Instruments memory capture still need completion.
-- Windows, Linux, fish shell, session sharing, telemetry, auto-update,
-  RAG/embeddings, and Go sidecars are intentionally out of scope.
+[MIT](LICENSE) © Brick Contributors

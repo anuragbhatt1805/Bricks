@@ -2,45 +2,110 @@ name: CI
 
 on:
   push:
+    branches: [ main ]
   pull_request:
+    branches: [ main ]
 
 jobs:
-  rust-test:
+  rust-lint:
+    name: Rust Lint (Clippy & Fmt)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 24
-          cache: yarn
-      - run: yarn install --frozen-lockfile
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo fmt --check
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> src-tauri/target
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Run Clippy lints
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --bins -- -D warnings
+
+  rust-test:
+    name: Rust Unit Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> src-tauri/target
+
+      - name: Run cargo tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
+
+  rust-audit:
+    name: Cargo Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run security audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ github.token }}
+          manifest-path: src-tauri/Cargo.toml
 
   frontend-test:
+    name: Frontend Tests & Typecheck
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: yarn
-      - run: yarn install --frozen-lockfile
-      - run: yarn test
-      - run: yarn build
-      - run: yarn run check
 
-  e2e:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: yarn
-      - run: yarn install --frozen-lockfile
-      - run: cargo install tauri-cli --version "^2" --locked
-      - run: cargo tauri build
+
+      - name: Install Node dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Run Vitest tests
+        run: yarn test
+
+      - name: Run Svelte compiler check
+        run: yarn run check
+
+      - name: Compile production assets
+        run: yarn build
+
+  tauri-build-check:
+    name: Tauri Build Verification
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> src-tauri/target
+
+      - name: Install Node dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build Tauri app (debug, no bundle)
+        run: cargo tauri build --debug

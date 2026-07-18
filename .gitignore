@@ -10,3 +10,8 @@ spill/
 .env
 .env.*
 !.env.example
+
+# Internal development docs — not for public repo
+PERFORMANCE.md
+QA_CHECKLIST.md
+TASK.md

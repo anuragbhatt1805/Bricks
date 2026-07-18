@@ -1,0 +1,81 @@
+name: Release
+
+# Trigger: git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  build-and-release:
+    name: Build & Release macOS App
+    permissions:
+      contents: write   # required to create GitHub Release and upload assets
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for changelog generation
+
+      # ── Node / Yarn ─────────────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      - name: Install Node dependencies
+        run: yarn install --frozen-lockfile
+
+      # ── Rust ────────────────────────────────────────────────────────────────
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> src-tauri/target
+
+      # ── Generate release notes from git log ─────────────────────────────────
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            LOG=$(git log --pretty=format:"- %s (%h)" | head -40)
+          else
+            LOG=$(git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)")
+          fi
+          echo "CHANGELOG<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$LOG" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      # ── Build unsigned .app + .dmg, publish GitHub Release ──────────────────
+      # No APPLE_CERTIFICATE or notarization — users allow via System Settings.
+      - name: Build Tauri App & Publish Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Brick ${{ github.ref_name }}'
+          releaseBody: |
+            ## What's Changed
+
+            ${{ steps.changelog.outputs.CHANGELOG }}
+
+            ---
+            ### Installation
+
+            1. Download `Brick_${{ github.ref_name }}_x64.dmg` (Intel) or `Brick_${{ github.ref_name }}_aarch64.dmg` (Apple Silicon) below.
+            2. Open the DMG and drag **Brick.app** to your Applications folder.
+            3. On first launch macOS will show a Gatekeeper warning because this build is not notarized.
+               **To allow it:** open **System Settings → Privacy & Security**, scroll down, and click **"Open Anyway"**.
+
+            > Requires macOS 12 Monterey or later.
+          releaseDraft: false
+          prerelease: false
+          includeDebug: false
+          tauriScript: cargo tauri
